@@ -1,4 +1,4 @@
-ifrom setuptools import setup
+from setuptools import setup
 
 setup(
     name="unifi-doorbell-rotation",
