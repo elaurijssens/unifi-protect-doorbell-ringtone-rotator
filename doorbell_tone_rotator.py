@@ -29,12 +29,22 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # Logging
 # =========================
 
-def setup_logging(verbose: bool = False):
+def setup_logging(verbose: bool = False, log_file: Path | None = None):
     level = logging.DEBUG if verbose else logging.INFO
+
+    handlers = []
+
+    if log_file:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        handlers.append(logging.FileHandler(log_file))
+    else:
+        handlers.append(logging.StreamHandler(sys.stdout))
+
     logging.basicConfig(
         level=level,
         format="%(asctime)s [%(levelname)s] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=handlers,
     )
 
 
@@ -385,7 +395,17 @@ def main():
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
-    setup_logging(args.verbose)
+    cfg_path = Path(args.config)
+    cfg = load_config(cfg_path)
+
+    log_file = None
+    if cfg.get("log_file"):
+        base_path = Path(cfg.get("base_path", Path(__file__).resolve().parent))
+        log_file = Path(cfg["log_file"])
+        if not log_file.is_absolute():
+            log_file = base_path / log_file
+
+    setup_logging(args.verbose, log_file)
 
     cfg_path = Path(args.config)
     if args.configure:
