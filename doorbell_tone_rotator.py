@@ -1,21 +1,40 @@
 #!/usr/bin/env python3
+
 import argparse
 import json
+import logging
 import os
 import random
 import sys
 from pathlib import Path
 
 import requests
+import urllib3
 
 
 # =========================
-# Constants / defaults
+# Globals / constants
 # =========================
 
 DEFAULT_CONFIG_PATH = Path.home() / ".unifi_tone_rotation.json"
 ROTATION_SLOTS = ["rotation_a", "rotation_b"]
 MAX_DOORBELL_RINGTONES = 10
+
+# Silence self-signed cert warnings (UNVR)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+
+# =========================
+# Logging
+# =========================
+
+def setup_logging(verbose: bool = False):
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
 
 
 # =========================
@@ -32,35 +51,32 @@ def load_config(path: Path) -> dict:
 def save_config(cfg: dict, path: Path) -> None:
     with path.open("w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
-    print(f"Config saved to {path}")
+    logging.info("Config saved to %s", path)
 
 
 # =========================
-# Protect session login
+# Authentication (OS-level)
 # =========================
 
 def login_protect_session(base_url: str) -> requests.Session:
     """
-    Correct login flow for UNVR Pro / UniFi OS 4.4.3 / Protect 6.1.79.
-
-    Auth happens at OS level (/api/auth/login), not under /proxy/protect.
+    Authenticate exactly like the browser:
+    POST /api/auth/login (UniFi OS), then reuse session for Protect.
     """
-    import os, sys, requests
-
     username = os.getenv("UNVR_USER")
     password = os.getenv("UNVR_PASSWORD")
 
     if not username or not password:
-        print("Error: UNVR_USER and UNVR_PASSWORD must be set.")
+        logging.error("UNVR_USER and UNVR_PASSWORD must be set in the environment")
         sys.exit(1)
 
     sess = requests.Session()
-    sess.verify = False  # self-signed certs
+    sess.verify = False
 
-    login_url = f"{base_url}/api/auth/login"
+    logging.debug("Logging in via UniFi OS at %s", base_url)
 
     resp = sess.post(
-        login_url,
+        f"{base_url}/api/auth/login",
         json={
             "username": username,
             "password": password,
@@ -75,17 +91,16 @@ def login_protect_session(base_url: str) -> requests.Session:
     )
 
     if resp.status_code != 200:
-        print(f"Login failed: HTTP {resp.status_code}")
+        logging.error("Login failed: HTTP %s", resp.status_code)
         try:
-            print(resp.json())
+            logging.error(resp.json())
         except Exception:
-            print(resp.text)
+            logging.error(resp.text)
         sys.exit(1)
 
-    # CSRF token is REQUIRED for Protect writes
-    csrf = resp.headers.get("X-CSRF-Token") or resp.headers.get("x-csrf-token")
+    csrf = resp.headers.get("x-csrf-token") or resp.headers.get("X-CSRF-Token")
     if not csrf:
-        print("Login succeeded but no CSRF token received.")
+        logging.error("Login succeeded but no CSRF token received")
         sys.exit(1)
 
     sess.headers.update({
@@ -93,20 +108,44 @@ def login_protect_session(base_url: str) -> requests.Session:
         "Accept": "application/json",
     })
 
+    logging.debug("Login successful, CSRF token set")
     return sess
+
+
+def protect_request(
+        method: str,
+        sess: requests.Session,
+        base_url: str,
+        path: str,
+        retry: bool = True,
+        **kwargs,
+):
+    """
+    Wrapper for Protect API calls with automatic re-auth on 401.
+    """
+    url = f"{base_url}{path}"
+    resp = sess.request(method, url, **kwargs)
+
+    if resp.status_code == 401 and retry:
+        logging.warning("401 from %s, re-authenticating once", path)
+        sess = login_protect_session(base_url)
+        resp = sess.request(method, url, **kwargs)
+
+    resp.raise_for_status()
+    return resp
+
+
 # =========================
 # Protect API helpers
 # =========================
 
-def get_cameras(sess: requests.Session, base_url: str):
-    r = sess.get(f"{base_url}/proxy/protect/api/cameras")
-    r.raise_for_status()
+def get_cameras(sess, base_url):
+    r = protect_request("GET", sess, base_url, "/proxy/protect/api/cameras")
     return r.json()
 
 
-def get_camera(sess: requests.Session, base_url: str, cam_id: str):
-    r = sess.get(f"{base_url}/proxy/protect/api/cameras/{cam_id}")
-    r.raise_for_status()
+def get_camera(sess, base_url, cam_id):
+    r = protect_request("GET", sess, base_url, f"/proxy/protect/api/cameras/{cam_id}")
     return r.json()
 
 
@@ -119,9 +158,8 @@ def is_doorbell(cam: dict) -> bool:
     return "doorbell" in model or "doorbell" in name
 
 
-def get_ringtones(sess: requests.Session, base_url: str):
-    r = sess.get(f"{base_url}/proxy/protect/api/files/ringtones")
-    r.raise_for_status()
+def get_ringtones(sess, base_url):
+    r = protect_request("GET", sess, base_url, "/proxy/protect/api/files/ringtones")
     return r.json()
 
 
@@ -142,21 +180,30 @@ def group_ringtones_by_original(ringtones):
 
 
 def delete_ringtone(sess, base_url, ringtone_id):
-    r = sess.delete(
-        f"{base_url}/proxy/protect/api/files/ringtones/{ringtone_id}",
+    logging.info("Deleting existing ringtone id=%s", ringtone_id)
+    protect_request(
+        "DELETE",
+        sess,
+        base_url,
+        f"/proxy/protect/api/files/ringtones/{ringtone_id}",
         params={"ignoreFileExtension": "true"},
     )
-    r.raise_for_status()
 
 
 def upload_ringtone(sess, base_url, slot_name: str, mp3_path: Path):
-    url = f"{base_url}/proxy/protect/api/files/ringtones"
+    logging.info("Uploading %s as slot '%s'", mp3_path.name, slot_name)
+
     with mp3_path.open("rb") as f:
         files = {
             "file": (f"{slot_name}.mp3", f, "audio/mpeg"),
         }
-        r = sess.post(url, files=files)
-    r.raise_for_status()
+        r = protect_request(
+            "POST",
+            sess,
+            base_url,
+            "/proxy/protect/api/files/ringtones",
+            files=files,
+        )
 
     doorbell = None
     for item in r.json():
@@ -185,11 +232,14 @@ def patch_camera_ringtone(sess, base_url, cam_id, ringtone_id):
 
     payload["speakerSettings"]["ringtoneId"] = ringtone_id
 
-    r = sess.patch(
-        f"{base_url}/proxy/protect/api/cameras/{cam_id}",
+    logging.info("Setting doorbell %s to ringtone %s", cam_id, ringtone_id)
+    protect_request(
+        "PATCH",
+        sess,
+        base_url,
+        f"/proxy/protect/api/cameras/{cam_id}",
         json=payload,
     )
-    r.raise_for_status()
 
 
 # =========================
@@ -203,7 +253,7 @@ def configure(cfg_path: Path):
     ringtone_dir = input(f"MP3 directory [{cfg.get('ringtone_directory', '')}]: ").strip() or cfg.get("ringtone_directory")
 
     if not base_url or not ringtone_dir:
-        print("Base URL and MP3 directory are required.")
+        logging.error("Base URL and MP3 directory are required")
         sys.exit(1)
 
     sess = login_protect_session(base_url)
@@ -218,8 +268,7 @@ def configure(cfg_path: Path):
     selected = []
     if raw:
         for part in raw.split(","):
-            i = int(part.strip())
-            selected.append(cams[i]["id"])
+            selected.append(cams[int(part.strip())]["id"])
 
     cfg.update({
         "base_url": base_url,
@@ -237,7 +286,7 @@ def configure(cfg_path: Path):
 def run(cfg_path: Path):
     cfg = load_config(cfg_path)
     if not cfg:
-        print("Config not found. Run with --configure first.")
+        logging.error("Config not found. Run with --configure first.")
         sys.exit(1)
 
     base_url = cfg["base_url"]
@@ -245,12 +294,12 @@ def run(cfg_path: Path):
     doorbells = cfg.get("doorbell_ids", [])
 
     if not doorbells:
-        print("No doorbells configured.")
+        logging.warning("No doorbells configured; nothing to do")
         return
 
     mp3s = [p for p in mp3_dir.iterdir() if p.suffix.lower() == ".mp3"]
     if not mp3s:
-        print("No MP3 files found.")
+        logging.error("No MP3 files found in %s", mp3_dir)
         sys.exit(1)
 
     sess = login_protect_session(base_url)
@@ -259,43 +308,38 @@ def run(cfg_path: Path):
     grouped = group_ringtones_by_original(ringtones)
     count = count_doorbell_ringtones(ringtones)
 
-    slot = ROTATION_SLOTS[0]
-    for s in ROTATION_SLOTS:
-        if s not in grouped:
-            slot = s
-            break
+    slot = next((s for s in ROTATION_SLOTS if s not in grouped), ROTATION_SLOTS[0])
 
     if count >= MAX_DOORBELL_RINGTONES and slot not in grouped:
-        print("Error: doorbell ringtone limit reached.")
+        logging.error("Doorbell ringtone limit reached (%s)", count)
         sys.exit(1)
 
     if slot in grouped:
         delete_ringtone(sess, base_url, grouped[slot][0]["id"])
 
     chosen = random.choice(mp3s)
-    print(f"Uploading {chosen.name} as {slot}")
-
     ringtone = upload_ringtone(sess, base_url, slot, chosen)
 
     for cam_id in doorbells:
-        print(f"Setting doorbell {cam_id} → {slot}")
         patch_camera_ringtone(sess, base_url, cam_id, ringtone["id"])
 
-    print("Rotation complete.")
+    logging.info("Rotation run completed successfully")
 
 
 # =========================
-# main
+# Main
 # =========================
 
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--configure", action="store_true")
-    p.add_argument("--config", default=str(DEFAULT_CONFIG_PATH))
-    args = p.parse_args()
+    parser = argparse.ArgumentParser(description="UniFi Protect doorbell ringtone rotator")
+    parser.add_argument("--configure", action="store_true")
+    parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH))
+    parser.add_argument("--verbose", action="store_true")
+    args = parser.parse_args()
+
+    setup_logging(args.verbose)
 
     cfg_path = Path(args.config)
-
     if args.configure:
         configure(cfg_path)
     else:
