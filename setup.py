@@ -1,3 +1,7 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2025 Emma Laurijssens van Engelenhovenfrom setuptools import setup
+
 from setuptools import setup
 
 setup(
@@ -10,7 +14,10 @@ setup(
         "Supports configuration mode and rotation using cron."
     ),
     long_description_content_type="text/plain",
-    author="Your Name",
+    author="Emma Laurijssens van Engelenhoven",
+    url="https://github.com/emmalaurijssens/unifi-doorbell-rotation",
+    keywords="unifi protect doorbell ringtone rottator",
+
     python_requires=">=3.9",
     py_modules=["doorbell_tone_rotator"],
     install_requires=[
