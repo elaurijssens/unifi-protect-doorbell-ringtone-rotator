@@ -55,7 +55,7 @@ def save_config(cfg: dict, path: Path) -> None:
 
 
 # =========================
-# Authentication (OS-level)
+# Authentication (UniFi OS)
 # =========================
 
 def login_protect_session(base_url: str) -> requests.Session:
@@ -127,7 +127,7 @@ def protect_request(
     resp = sess.request(method, url, **kwargs)
 
     if resp.status_code == 401 and retry:
-        logging.warning("401 from %s, re-authenticating once", path)
+        logging.warning("401 from %s, re-authenticating", path)
         sess = login_protect_session(base_url)
         resp = sess.request(method, url, **kwargs)
 
@@ -249,11 +249,20 @@ def patch_camera_ringtone(sess, base_url, cam_id, ringtone_id):
 def configure(cfg_path: Path):
     cfg = load_config(cfg_path)
 
-    base_url = input(f"Base URL [{cfg.get('base_url', '')}]: ").strip() or cfg.get("base_url")
-    ringtone_dir = input(f"MP3 directory [{cfg.get('ringtone_directory', '')}]: ").strip() or cfg.get("ringtone_directory")
+    script_base_path = Path(__file__).resolve().parent
 
-    if not base_url or not ringtone_dir:
-        logging.error("Base URL and MP3 directory are required")
+    base_url = input(f"Base URL [{cfg.get('base_url', '')}]: ").strip() or cfg.get("base_url")
+    sounds_rel = input(
+        f"Sounds directory (relative to script base) [{cfg.get('sounds_path', 'sounds')}]: "
+    ).strip() or cfg.get("sounds_path", "sounds")
+
+    if not base_url:
+        logging.error("Base URL is required")
+        sys.exit(1)
+
+    sounds_abs = script_base_path / sounds_rel
+    if not sounds_abs.is_dir():
+        logging.error("Sounds directory does not exist: %s", sounds_abs)
         sys.exit(1)
 
     sess = login_protect_session(base_url)
@@ -272,7 +281,8 @@ def configure(cfg_path: Path):
 
     cfg.update({
         "base_url": base_url,
-        "ringtone_directory": ringtone_dir,
+        "base_path": str(script_base_path),
+        "sounds_path": sounds_rel,
         "doorbell_ids": selected,
     })
 
@@ -290,8 +300,13 @@ def run(cfg_path: Path):
         sys.exit(1)
 
     base_url = cfg["base_url"]
-    mp3_dir = Path(cfg["ringtone_directory"])
+    base_path = Path(cfg["base_path"])
+    mp3_dir = base_path / cfg["sounds_path"]
     doorbells = cfg.get("doorbell_ids", [])
+
+    if not mp3_dir.is_dir():
+        logging.error("Configured sounds directory does not exist: %s", mp3_dir)
+        sys.exit(1)
 
     if not doorbells:
         logging.warning("No doorbells configured; nothing to do")
