@@ -162,13 +162,6 @@ def get_ringtones(sess, base_url):
     return r.json()
 
 
-def count_doorbell_ringtones(ringtones):
-    return sum(
-        1 for r in ringtones
-        if "doorbell" in (r.get("metadata") or {}).get("supportedBy", [])
-    )
-
-
 def group_ringtones_by_original(ringtones):
     grouped = {}
     for r in ringtones:
@@ -189,13 +182,11 @@ def delete_ringtone(sess, base_url, ringtone_id):
     )
 
 
-def upload_ringtone(sess, base_url, slot_name: str, mp3_path: Path):
-    logging.info("Uploading %s as slot '%s'", mp3_path.name, slot_name)
+def upload_ringtone(sess, base_url, name: str, mp3_path: Path):
+    logging.info("Uploading %s as '%s'", mp3_path.name, name)
 
     with mp3_path.open("rb") as f:
-        files = {
-            "file": (f"{slot_name}.mp3", f, "audio/mpeg"),
-        }
+        files = {"file": (f"{name}.mp3", f, "audio/mpeg")}
         r = protect_request(
             "POST",
             sess,
@@ -204,18 +195,21 @@ def upload_ringtone(sess, base_url, slot_name: str, mp3_path: Path):
             files=files,
         )
 
-    doorbell = None
     for item in r.json():
         if "doorbell" in (item.get("metadata") or {}).get("supportedBy", []):
-            doorbell = item
+            return item
 
-    if not doorbell:
-        raise RuntimeError("Upload succeeded but no doorbell ringtone returned")
-
-    return doorbell
+    raise RuntimeError("Upload succeeded but no doorbell ringtone returned")
 
 
-def patch_camera_ringtone(sess, base_url, cam_id, ringtone_id):
+def patch_camera_ringtone(
+        sess,
+        base_url,
+        cam_id,
+        ringtone_id,
+        play_times: int,
+        volume: int,
+):
     cam = get_camera(sess, base_url, cam_id)
 
     payload = {
@@ -230,8 +224,14 @@ def patch_camera_ringtone(sess, base_url, cam_id, ringtone_id):
     }
 
     payload["speakerSettings"]["ringtoneId"] = ringtone_id
+    payload["speakerSettings"]["repeatTimes"] = play_times
+    payload["speakerSettings"]["ringVolume"] = volume
 
-    logging.info("Setting doorbell %s to ringtone %s", cam_id, ringtone_id)
+    logging.info(
+        "Setting doorbell %s to ringtone %s (repeat=%s volume=%s)",
+        cam_id, ringtone_id, play_times, volume
+    )
+
     protect_request(
         "PATCH",
         sess,
@@ -242,12 +242,47 @@ def patch_camera_ringtone(sess, base_url, cam_id, ringtone_id):
 
 
 # =========================
+# Sound resolution
+# =========================
+
+def resolve_sound(cfg: dict, base_path: Path, mp3_dir: Path) -> dict:
+    defaults = cfg.get("default_sound_properties", {})
+    default_play = defaults.get("play_times", 1)
+    default_volume = defaults.get("volume_percentage", 50)
+
+    sound_props = cfg.get("sound_properties")
+
+    if sound_props:
+        entry = random.choice(sound_props)
+        file_name = entry["file_name"]
+
+        if "path" in entry:
+            path = Path(entry["path"])
+            if not path.is_absolute():
+                path = base_path / path
+        else:
+            path = mp3_dir / file_name
+
+        return {
+            "path": path,
+            "play_times": entry.get("play_times", default_play),
+            "volume": entry.get("volume_percentage", default_volume),
+        }
+
+    chosen = random.choice(list(mp3_dir.glob("*.mp3")))
+    return {
+        "path": chosen,
+        "play_times": default_play,
+        "volume": default_volume,
+    }
+
+
+# =========================
 # Configure mode
 # =========================
 
 def configure(cfg_path: Path):
     cfg = load_config(cfg_path)
-
     script_base_path = Path(__file__).resolve().parent
 
     base_url = input(f"Base URL [{cfg.get('base_url', '')}]: ").strip() or cfg.get("base_url")
@@ -255,9 +290,9 @@ def configure(cfg_path: Path):
         f"Sounds directory (relative to script base) [{cfg.get('sounds_path', 'sounds')}]: "
     ).strip() or cfg.get("sounds_path", "sounds")
 
-    if not base_url:
-        logging.error("Base URL is required")
-        sys.exit(1)
+    defaults = cfg.get("default_sound_properties", {})
+    play_times = int(input(f"Default play times [{defaults.get('play_times', 1)}]: ") or defaults.get("play_times", 1))
+    volume = int(input(f"Default volume percentage [{defaults.get('volume_percentage', 50)}]: ") or defaults.get("volume_percentage", 50))
 
     sounds_abs = script_base_path / sounds_rel
     if not sounds_abs.is_dir():
@@ -273,16 +308,17 @@ def configure(cfg_path: Path):
         print(f"{idx}: {label} {cam.get('name')} ({cam.get('id')})")
 
     raw = input("\nSelect doorbells by index (comma-separated): ").strip()
-    selected = []
-    if raw:
-        for part in raw.split(","):
-            selected.append(cams[int(part.strip())]["id"])
+    selected = [cams[int(p.strip())]["id"] for p in raw.split(",")] if raw else []
 
     cfg.update({
         "base_url": base_url,
         "base_path": str(script_base_path),
         "sounds_path": sounds_rel,
         "doorbell_ids": selected,
+        "default_sound_properties": {
+            "play_times": play_times,
+            "volume_percentage": volume,
+        },
     })
 
     save_config(cfg, cfg_path)
@@ -311,25 +347,27 @@ def run(cfg_path: Path):
         logging.warning("No doorbells configured; nothing to do")
         return
 
-    mp3s = [p for p in mp3_dir.iterdir() if p.suffix.lower() == ".mp3"]
-    if not mp3s:
-        logging.error("No MP3 files found in %s", mp3_dir)
-        sys.exit(1)
-
     sess = login_protect_session(base_url)
     ringtones = get_ringtones(sess, base_url)
-
     grouped = group_ringtones_by_original(ringtones)
 
     for cam_id in doorbells:
         managed_name = f"doorbell_{cam_id}"
+
         if managed_name in grouped:
             delete_ringtone(sess, base_url, grouped[managed_name][0]["id"])
 
-        chosen = random.choice(mp3s)
-        ringtone = upload_ringtone(sess, base_url, managed_name, chosen)
+        sound = resolve_sound(cfg, base_path, mp3_dir)
+        ringtone = upload_ringtone(sess, base_url, managed_name, sound["path"])
 
-        patch_camera_ringtone(sess, base_url, cam_id, ringtone["id"])
+        patch_camera_ringtone(
+            sess,
+            base_url,
+            cam_id,
+            ringtone["id"],
+            sound["play_times"],
+            sound["volume"],
+        )
 
     logging.info("Rotation run completed successfully")
 
