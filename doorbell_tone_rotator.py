@@ -17,7 +17,6 @@ import urllib3
 # =========================
 
 DEFAULT_CONFIG_PATH = Path.home() / ".unifi_tone_rotation.json"
-ROTATION_SLOTS = ["rotation_a", "rotation_b"]
 MAX_DOORBELL_RINGTONES = 10
 
 # Silence self-signed cert warnings (UNVR)
@@ -321,21 +320,15 @@ def run(cfg_path: Path):
     ringtones = get_ringtones(sess, base_url)
 
     grouped = group_ringtones_by_original(ringtones)
-    count = count_doorbell_ringtones(ringtones)
-
-    slot = next((s for s in ROTATION_SLOTS if s not in grouped), ROTATION_SLOTS[0])
-
-    if count >= MAX_DOORBELL_RINGTONES and slot not in grouped:
-        logging.error("Doorbell ringtone limit reached (%s)", count)
-        sys.exit(1)
-
-    if slot in grouped:
-        delete_ringtone(sess, base_url, grouped[slot][0]["id"])
-
-    chosen = random.choice(mp3s)
-    ringtone = upload_ringtone(sess, base_url, slot, chosen)
 
     for cam_id in doorbells:
+        managed_name = f"doorbell_{cam_id}"
+        if managed_name in grouped:
+            delete_ringtone(sess, base_url, grouped[managed_name][0]["id"])
+
+        chosen = random.choice(mp3s)
+        ringtone = upload_ringtone(sess, base_url, managed_name, chosen)
+
         patch_camera_ringtone(sess, base_url, cam_id, ringtone["id"])
 
     logging.info("Rotation run completed successfully")
